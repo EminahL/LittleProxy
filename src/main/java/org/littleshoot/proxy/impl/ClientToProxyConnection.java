@@ -103,7 +103,7 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
     /**
      * Keep track of all ProxyToServerConnections by host+port.
      */
-    private final Map<String, ProxyToServerConnection> serverConnectionsByHostAndPort = new ConcurrentHashMap<>();
+    private final Map<String, ProxyToServerConnection> connByHostAndPort = new ConcurrentHashMap<>();
 
     /**
      * Keep track of how many servers are currently in the process of
@@ -258,22 +258,14 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
             LOG.debug("Responding to client with short-circuit response from filter: {}", clientToProxyFilterResponse);
 
             boolean keepAlive = respondWithShortCircuitResponse(clientToProxyFilterResponse);
-            if (keepAlive) {
-                return AWAITING_INITIAL;
-            } else {
-                return DISCONNECT_REQUESTED;
-            }
+            return  checkConnectionState(keepAlive);
         }
 
         // if origin-form requests are not explicitly enabled, short-circuit requests that treat the proxy as the
         // origin server, to avoid infinite loops
         if (!proxyServer.isAllowRequestsToOriginServer() && isRequestToOriginServer(httpRequest)) {
             boolean keepAlive = writeBadRequest(httpRequest);
-            if (keepAlive) {
-                return AWAITING_INITIAL;
-            } else {
-                return DISCONNECT_REQUESTED;
-            }
+            return checkConnectionState(keepAlive);
         }
 
         // Identify our server and chained proxy
@@ -284,17 +276,13 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
         if (serverHostAndPort == null || StringUtils.isBlank(serverHostAndPort)) {
             LOG.warn("No host and port found in {}", httpRequest.uri());
             boolean keepAlive = writeBadGateway(httpRequest);
-            if (keepAlive) {
-                return AWAITING_INITIAL;
-            } else {
-                return DISCONNECT_REQUESTED;
-            }
+            return checkConnectionState(keepAlive);
         }
 
         LOG.debug("Finding ProxyToServerConnection for: {}", serverHostAndPort);
         currentServerConnection = isMitming() || isTunneling() ?
                 this.currentServerConnection
-                : this.serverConnectionsByHostAndPort.get(serverHostAndPort);
+                : this.connByHostAndPort.get(serverHostAndPort);
 
         boolean newConnectionRequired = false;
         if (ProxyUtils.isCONNECT(httpRequest)) {
@@ -309,36 +297,9 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
         }
 
         if (newConnectionRequired) {
-            try {
-                currentServerConnection = ProxyToServerConnection.create(
-                        proxyServer,
-                        this,
-                        serverHostAndPort,
-                        currentFilters,
-                        httpRequest,
-                        globalTrafficShapingHandler);
-                if (currentServerConnection == null) {
-                    LOG.debug("Unable to create server connection, probably no chained proxies available");
-                    boolean keepAlive = writeBadGateway(httpRequest);
-                    resumeReading();
-                    if (keepAlive) {
-                        return AWAITING_INITIAL;
-                    } else {
-                        return DISCONNECT_REQUESTED;
-                    }
-                }
-                // Remember the connection for later
-                serverConnectionsByHostAndPort.put(serverHostAndPort,
-                        currentServerConnection);
-            } catch (UnknownHostException uhe) {
-                LOG.info("Bad Host {}", httpRequest.uri());
-                boolean keepAlive = writeBadGateway(httpRequest);
-                resumeReading();
-                if (keepAlive) {
-                    return AWAITING_INITIAL;
-                } else {
-                    return DISCONNECT_REQUESTED;
-                }
+            ConnectionState newConnectionState =  createNewServerConnection(serverHostAndPort, httpRequest);
+            if(newConnectionState != null){
+                return newConnectionState;
             }
         } else {
             LOG.debug("Reusing existing server connection: {}",
@@ -353,17 +314,31 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
             LOG.debug("Responding to client with short-circuit response from filter: {}", proxyToServerFilterResponse);
 
             boolean keepAlive = respondWithShortCircuitResponse(proxyToServerFilterResponse);
-            if (keepAlive) {
-                return AWAITING_INITIAL;
-            } else {
-                return DISCONNECT_REQUESTED;
-            }
+            return checkConnectionState(keepAlive);
         }
 
         LOG.debug("Writing request to ProxyToServerConnection");
         currentServerConnection.write(httpRequest, currentFilters);
 
         // Figure out our next state
+        return checkNextConnectionState(httpRequest);
+    }
+
+    /**
+     * Check the connection state
+     */
+    private ConnectionState checkConnectionState(boolean keepAlive) {
+        if (keepAlive) {
+            return AWAITING_INITIAL;
+        } else {
+            return DISCONNECT_REQUESTED;
+        }
+    }
+
+    /**
+     * Check the next connection state
+     */
+    private ConnectionState checkNextConnectionState(HttpRequest httpRequest){
         if (ProxyUtils.isCONNECT(httpRequest)) {
             return NEGOTIATING_CONNECT;
         } else if (ProxyUtils.isChunked(httpRequest)) {
@@ -371,6 +346,36 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
         } else {
             return AWAITING_INITIAL;
         }
+    }
+
+    /**
+     * Create a new server connection and see if the server connection is able to be connected
+     */
+    private ConnectionState createNewServerConnection(String serverHostAndPort, HttpRequest httpRequest){
+        try {
+            currentServerConnection = ProxyToServerConnection.create(
+                    proxyServer,
+                    this,
+                    serverHostAndPort,
+                    currentFilters,
+                    httpRequest,
+                    globalTrafficShapingHandler);
+            if (currentServerConnection == null) {
+                LOG.debug("Unable to create server connection, probably no chained proxies available");
+                boolean keepAlive = writeBadGateway(httpRequest);
+                resumeReading();
+                return checkConnectionState(keepAlive);
+            }
+            // Remember the connection for later
+            connByHostAndPort.put(serverHostAndPort,
+                    currentServerConnection);
+        } catch (UnknownHostException uhe) {
+            LOG.info("Bad Host {}", httpRequest.uri());
+            boolean keepAlive = writeBadGateway(httpRequest);
+            resumeReading();
+            return checkConnectionState(keepAlive);
+        }
+        return null;
     }
 
     /**
@@ -575,7 +580,7 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
     @Override
     protected void disconnected() {
         super.disconnected();
-        for (ProxyToServerConnection serverConnection : serverConnectionsByHostAndPort
+        for (ProxyToServerConnection serverConnection : connByHostAndPort
                 .values()) {
             serverConnection.disconnect();
         }
@@ -660,7 +665,7 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
         // the connection to the server failed, so disconnect the server and remove the ProxyToServerConnection from the
         // map of open server connections
         serverConnection.disconnect();
-        this.serverConnectionsByHostAndPort.remove(serverConnection.getServerHostAndPort());
+        this.connByHostAndPort.remove(serverConnection.getServerHostAndPort());
 
         boolean keepAlive = writeBadGateway(initialRequest);
         if (keepAlive) {
@@ -704,7 +709,7 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
     @Override
     synchronized protected void becameSaturated() {
         super.becameSaturated();
-        for (ProxyToServerConnection serverConnection : serverConnectionsByHostAndPort
+        for (ProxyToServerConnection serverConnection : connByHostAndPort
                 .values()) {
             synchronized (serverConnection) {
                 if (this.isSaturated()) {
@@ -721,7 +726,7 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
     @Override
     synchronized protected void becameWritable() {
         super.becameWritable();
-        for (ProxyToServerConnection serverConnection : serverConnectionsByHostAndPort
+        for (ProxyToServerConnection serverConnection : connByHostAndPort
                 .values()) {
             synchronized (serverConnection) {
                 if (!this.isSaturated()) {
@@ -749,7 +754,7 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
     synchronized protected void serverBecameWriteable(
             ProxyToServerConnection serverConnection) {
         boolean anyServersSaturated = false;
-        for (ProxyToServerConnection otherServerConnection : serverConnectionsByHostAndPort
+        for (ProxyToServerConnection otherServerConnection : connByHostAndPort
                 .values()) {
             if (otherServerConnection.isSaturated()) {
                 anyServersSaturated = true;
@@ -1104,7 +1109,7 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
      * request headers to reflect that it was proxied.
      */
     private void modifyRequestHeadersToReflectProxying(HttpRequest httpRequest) {
-        if (isNextHopOriginServer()) {
+        if (currentServerConnection.checkIfNextHopOriginServer()) {
             /*
              * We are making the request to the origin server, so must modify
              * the 'absolute-URI' into the 'origin-form' as per RFC 7230
@@ -1132,32 +1137,6 @@ public class ClientToProxyConnection extends ProxyConnection<HttpRequest> {
             stripConnectionTokens(headers);
             stripHopByHopHeaders(headers);
             ProxyUtils.addVia(httpRequest, proxyServer.getProxyAlias());
-        }
-    }
-
-    private boolean isNextHopOriginServer() {
-        // If there is no upstream chained proxy, the next hop must be the origin server.
-        if (!currentServerConnection.hasUpstreamChainedProxy()) {
-            return true;
-        }
-
-        /*
-         * Upstream SOCKS proxies are a special case because they do not
-         * parse or modify the HTTP request in any way. If the upstream
-         * chained proxy is a SOCKS proxy, we should treat it as if we
-         * are connecting directly to the origin server.
-         */
-        switch (currentServerConnection.getChainedProxyType()) {
-            case HTTP:
-                return false;
-            case SOCKS4:
-            case SOCKS5:
-                return true;
-            default:
-                LOG.warn("Assuming upstream chained proxy of unknown type "
-                    + currentServerConnection.getChainedProxyType()
-                    + " should not be treated as an origin server");
-                return false;
         }
     }
 

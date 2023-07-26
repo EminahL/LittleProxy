@@ -408,25 +408,14 @@ public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
     @Override
     protected void become(ConnectionState newState) {
         // Report connection status to HttpFilters
-        if (getCurrentState() == DISCONNECTED && newState == CONNECTING) {
-            currentFilters.proxyToServerConnectionStarted();
+        if (getCurrentState() == DISCONNECTED) {
+            currentStateDisconnected(newState);
         } else if (getCurrentState() == CONNECTING) {
-            if (newState == HANDSHAKING) {
-                currentFilters.proxyToServerConnectionSSLHandshakeStarted();
-            } else if (newState == AWAITING_INITIAL) {
-                currentFilters.proxyToServerConnectionSucceeded(ctx);
-            } else if (newState == DISCONNECTED) {
-                currentFilters.proxyToServerConnectionFailed();
-            }
+            currentStateConnecting(newState);
         } else if (getCurrentState() == HANDSHAKING) {
-            if (newState == AWAITING_INITIAL) {
-                currentFilters.proxyToServerConnectionSucceeded(ctx);
-            } else if (newState == DISCONNECTED) {
-                currentFilters.proxyToServerConnectionFailed();
-            }
-        } else if (getCurrentState() == AWAITING_CHUNK
-                && newState != AWAITING_CHUNK) {
-            currentFilters.serverToProxyResponseReceived();
+            currentStateHandshaking(newState);
+        } else if (getCurrentState() == AWAITING_CHUNK) {
+            currentStateAwaitingChunk(newState);
         }
 
         super.become(newState);
@@ -529,6 +518,33 @@ public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
 
     public HttpRequest getInitialRequest() {
         return initialRequest;
+    }
+
+    public boolean checkIfNextHopOriginServer(){
+        // If there is no upstream chained proxy, the next hop must be the origin server.
+        if (!hasUpstreamChainedProxy()) {
+            return true;
+        }
+
+        /*
+         * Upstream SOCKS proxies are a special case because they do not
+         * parse or modify the HTTP request in any way. If the upstream
+         * chained proxy is a SOCKS proxy, we should treat it as if we
+         * are connecting directly to the origin server.
+         */
+        switch (getChainedProxyType()) {
+            case HTTP:
+                return false;
+            case SOCKS4:
+            case SOCKS5:
+                return true;
+            default:
+                LOG.warn("Assuming upstream chained proxy of unknown type "
+                        + getChainedProxyType()
+                        + " should not be treated as an origin server");
+                return false;
+        }
+
     }
 
     @Override
@@ -650,6 +666,48 @@ public class ProxyToServerConnection extends ProxyConnection<HttpResponse> {
 
     private void removeHandlerIfPresent(String name) {
         removeHandlerIfPresent(channel.pipeline(), name);
+    }
+
+    /**
+     * If the current state is connecting, check what the new state is and make a proxy to server connection accordingly.
+      */
+    private void currentStateConnecting(ConnectionState newState){
+        if (newState == HANDSHAKING) {
+            currentFilters.proxyToServerConnectionSSLHandshakeStarted();
+        } else if (newState == AWAITING_INITIAL) {
+            currentFilters.proxyToServerConnectionSucceeded(ctx);
+        } else if (newState == DISCONNECTED) {
+            currentFilters.proxyToServerConnectionFailed();
+        }
+    }
+
+    /**
+     * If the current state is handshaking, check what the new state is and make a proxy to server connection accordingly.
+      */
+    private void currentStateHandshaking(ConnectionState newState){
+        if (newState == AWAITING_INITIAL) {
+            currentFilters.proxyToServerConnectionSucceeded(ctx);
+        } else if (newState == DISCONNECTED) {
+            currentFilters.proxyToServerConnectionFailed();
+        }
+    }
+
+    /**
+     * If the current state is awaiting, check what the new state is and make a proxy to server connection accordingly.
+      */
+    private void currentStateAwaitingChunk(ConnectionState newState){
+        if(newState != AWAITING_CHUNK){
+            currentFilters.serverToProxyResponseReceived();
+        }
+    }
+
+    /**
+     * If the current state is disconnected, start the new connection if the new state is connecting.
+      */
+    private void currentStateDisconnected(ConnectionState newState){
+        if(newState == CONNECTING){
+            currentFilters.proxyToServerConnectionStarted();
+        }
     }
 
     /**
